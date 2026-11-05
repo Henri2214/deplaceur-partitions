@@ -17,50 +17,15 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-if (-not $DossierRapport) { $DossierRapport = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) 'rapports' }
-Set-StrictMode -Version 3
 
-# --- Constantes GPT (types de partition, indépendants de la langue) -----------------------------
-$GPT = @{
-    EFI      = '{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}'
-    MSR      = '{e3c9e316-0b5c-4db8-817d-f92df00215ae}'
-    Basic    = '{ebd0a0a2-b9e5-4433-87c0-68b6b72699c7}'
-    Recovery = '{de94bba4-06d1-4d40-a16a-bfd50179d6ac}'
-}
+$Racine = Split-Path -Parent $MyInvocation.MyCommand.Path
+. (Join-Path $Racine 'lib\Commun.ps1')
 $MiB = 1MB
 $Tolerance = 2MB   # trou inférieur = alignement, pas de l'espace libre exploitable
 
-function Test-Admin {
-    $p = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
-    return $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-}
-
-function Format-Taille([double]$o) {
-    if ($o -ge 1TB) { return '{0:N2} To' -f ($o / 1TB) }
-    if ($o -ge 1GB) { return '{0:N2} Go' -f ($o / 1GB) }
-    return '{0:N0} Mo' -f ($o / 1MB)
-}
-
-function Get-Firmware {
-    # API GetFirmwareType (Windows 8+, sans droits admin) : 1 = BIOS, 2 = UEFI. Replis : registre, journal d'installation.
-    try {
-        if (-not ('DP.Firmware' -as [type])) {
-            Add-Type -Namespace DP -Name Firmware -MemberDefinition '[DllImport("kernel32.dll")] public static extern bool GetFirmwareType(out int t);'
-        }
-        $t = 0
-        if ([DP.Firmware]::GetFirmwareType([ref]$t)) {
-            if ($t -eq 2) { return 'UEFI' } elseif ($t -eq 1) { return 'BIOS' }
-        }
-    } catch { }
-    try {
-        $v = (Get-ItemProperty 'HKLM:\System\CurrentControlSet\Control' -Name PEFirmwareType -ErrorAction Stop).PEFirmwareType
-        if ($v -eq 2) { return 'UEFI' } elseif ($v -eq 1) { return 'BIOS' }
-    } catch { }
-    if (Test-Path "$env:SystemRoot\Panther\setupact.log") {
-        $l = Select-String -Path "$env:SystemRoot\Panther\setupact.log" -Pattern 'Detected boot environment: (\w+)' -List
-        if ($l) { return ($l.Matches[0].Groups[1].Value -replace 'EFI', 'UEFI') }
-    }
-    return 'INCONNU'
+function Test-ContientWindows($p) {
+    $l = Get-LettrePartition $p
+    return [bool]($p.IsBoot -or ($l -and (Test-Path -LiteralPath "$l\Windows\System32\config\SYSTEM")))
 }
 
 function Get-Role($p, [string]$style) {
@@ -69,58 +34,14 @@ function Get-Role($p, [string]$style) {
             $GPT.EFI      { return 'EFI' }
             $GPT.MSR      { return 'MSR' }
             $GPT.Recovery { return 'Recovery' }
-            $GPT.Basic    { if ($p.IsBoot) { return 'Windows' } else { return 'Données' } }
+            $GPT.Basic    { if (Test-ContientWindows $p) { return 'Windows' } else { return 'Données' } }
             default       { return 'Autre' }
         }
     }
-    if ($p.IsBoot) { return 'Windows' }
-    if ($p.IsActive -or $p.IsSystem) { return 'Système (MBR)' }
+    if (Test-ContientWindows $p) { return 'Windows' }
+    if ($p.IsActive -or ($p.IsSystem -and -not (Test-WinPE))) { return 'Système (MBR)' }
     if ($p.MbrType -eq 0x27) { return 'Recovery' }
     return 'Données'
-}
-
-function Get-WinRE {
-    # ReAgent.xml : format XML, indépendant de la langue (contrairement à la sortie de reagentc).
-    $f = Join-Path $env:SystemRoot 'System32\Recovery\ReAgent.xml'
-    $r = [ordered]@{ fichier = $f; lu = $false; active = $null; offset = $null; guid_disque = $null; chemin = $null }
-    try {
-        [xml]$x = Get-Content -LiteralPath $f -Raw -ErrorAction Stop
-        $r.lu = $true
-        $loc = $x.WindowsRE.WinreLocation
-        $bcd = $x.WindowsRE.WinreBCD.id
-        $r.active = ($bcd -and $bcd -ne '{00000000-0000-0000-0000-000000000000}')
-        if ($loc) { $r.offset = [int64]$loc.offset; $r.guid_disque = $loc.guid; $r.chemin = $loc.path }
-    } catch { $r.erreur = $_.Exception.Message }
-    return $r
-}
-
-function Get-BitLocker([string]$lettre) {
-    $r = [ordered]@{ lu = $false; protection = $null; conversion = $null }
-    try {
-        $v = Get-CimInstance -Namespace 'root\cimv2\Security\MicrosoftVolumeEncryption' -ClassName Win32_EncryptableVolume `
-            -Filter "DriveLetter='$($lettre):'" -ErrorAction Stop
-        if ($v) {
-            $r.lu = $true
-            $r.protection = @{ 0 = 'désactivée'; 1 = 'ACTIVE'; 2 = 'inconnue' }[[int]$v.ProtectionStatus]
-            $r.conversion = @{ 0 = 'non chiffré'; 1 = 'chiffré'; 2 = 'chiffrement en cours'; 3 = 'déchiffrement en cours';
-                               4 = 'chiffrement en pause'; 5 = 'déchiffrement en pause' }[[int]$v.ConversionStatus]
-        }
-    } catch { $r.erreur = 'droits administrateur requis' }
-    return $r
-}
-
-function Get-BcdEntree([string]$id) {
-    # Les noms de champs de bcdedit (device, path…) ne sont pas traduits ; seuls les titres le sont.
-    $r = [ordered]@{ lu = $false }
-    $out = & bcdedit.exe /enum $id /v 2>&1
-    if ($LASTEXITCODE -ne 0) { $r.erreur = 'droits administrateur requis'; return $r }
-    $r.lu = $true
-    foreach ($ligne in $out) {
-        if ($ligne -match '^(identifier|device|osdevice|path|recoverysequence|recoveryenabled)\s+(.+)$') {
-            $r[$Matches[1]] = $Matches[2].Trim()
-        }
-    }
-    return $r
 }
 
 function Get-Segments($disk, $parts) {
@@ -143,16 +64,19 @@ function Get-Segments($disk, $parts) {
 }
 
 # =================================================================================================
+if (-not $DossierRapport) { $DossierRapport = Join-Path $Racine 'rapports' }
 $admin = Test-Admin
 if (-not $admin) {
     Write-Warning 'Pas en administrateur : BitLocker, BCD et contenu de la partition EFI ne seront pas vérifiés.'
 }
 
-if ($Disque -lt 0) { $Disque = (Get-Partition -DriveLetter ($env:SystemDrive.TrimEnd(':'))).DiskNumber }
+if ($Disque -lt 0) {
+    if (Test-WinPE) { throw 'Sous WinPE, précisez -Disque <numéro> (Get-Disk pour la liste).' }
+    $Disque = (Get-Partition -DriveLetter ($env:SystemDrive.TrimEnd(':'))).DiskNumber
+}
 $disk = Get-Disk -Number $Disque
 $parts = @(Get-Partition -DiskNumber $Disque | Sort-Object Offset)
 $firmware = Get-Firmware
-$winre = Get-WinRE
 
 $partitions = foreach ($p in $parts) {
     $vol = $null
@@ -178,10 +102,12 @@ $partitions = @($partitions)
 $segments = @(Get-Segments $disk $parts)
 
 $win = $partitions | Where-Object role -eq 'Windows' | Select-Object -First 1
-$sys = $partitions | Where-Object { $_.est_systeme } | Select-Object -First 1
+$sys = $partitions | Where-Object { $_.role -in 'EFI', 'Système (MBR)' } | Select-Object -First 1
+$winre = if ($win -and $win.lettre) { Get-WinRE "$($win.lettre)\Windows" } else { Get-WinRE }
+$enLigne = -not (Test-WinPE)
 $bitlocker = if ($win -and $win.lettre) { Get-BitLocker $win.lettre.TrimEnd(':') } else { @{ lu = $false } }
-$bcdMgr = if ($admin) { Get-BcdEntree '{bootmgr}' } else { @{ lu = $false } }
-$bcdOs = if ($admin) { Get-BcdEntree '{current}' } else { @{ lu = $false } }
+$bcdMgr = if ($admin -and $enLigne) { Get-BcdEntree '{bootmgr}' } else { @{ lu = $false } }
+$bcdOs = if ($admin -and $enLigne) { Get-BcdEntree '{current}' } else { @{ lu = $false } }
 
 # --- Vérification de la chaîne de démarrage -------------------------------------------------------
 $demarrage = [ordered]@{ fichier_boot = $null; fichier_boot_present = $null }
@@ -207,7 +133,7 @@ if ($win) {
 
     if ($apres -and $apres.type -eq 'libre') {
         Add-Constat 'OK' 'EXT-001' "$(Format-Taille $apres.taille) libres juste après $($win.lettre) : extension possible sous Windows, sans redémarrage." `
-            'Agrandir C: (en ligne, sans risque pour le démarrage).'
+            'Operations.ps1 -Action Agrandir (en ligne, sans risque pour le démarrage).'
     } elseif ($apres -and $apres.type -eq 'partition') {
         $p2 = $partitions | Where-Object numero -eq $apres.numero
         $libreDerriere = $segments | Where-Object { $_.type -eq 'libre' -and $_.offset -ge $p2.fin } | Measure-Object taille -Sum
@@ -215,7 +141,7 @@ if ($win) {
             $txt = "La partition de récupération (n°$($p2.numero), $(Format-Taille $p2.taille)) est collée derrière $($win.lettre) : elle bloque son agrandissement."
             if ($libreDerriere.Sum -ge 1GB) {
                 Add-Constat 'BLOQUANT' 'EXT-002' "$txt $(Format-Taille $libreDerriere.Sum) libres se trouvent derrière elle." `
-                    'Procédure en ligne : désactiver WinRE, sauvegarder puis déplacer Recovery en fin de disque, agrandir C:, réactiver WinRE.'
+                    'Operations.ps1 -Action DeplacerRecovery (en ligne : WinRE désactivé, Recovery recréée en fin de disque, C: agrandi, WinRE réactivé).'
             } else {
                 Add-Constat 'INFO' 'EXT-003' "$txt Pas d'espace libre utile derrière elle (< 1 Go) : rien à récupérer pour l'instant."
             }
@@ -225,7 +151,7 @@ if ($win) {
     }
     if ($avant -and $avant.type -eq 'libre') {
         Add-Constat 'WINPE' 'MOV-001' "$(Format-Taille $avant.taille) libres AVANT $($win.lettre) : les récupérer impose de déplacer le début de C:." `
-            'Opération hors ligne uniquement (démarrage WinPE) : C: est verrouillé tant que Windows tourne.'
+            'Clé WinPE : WinPE\Deplacer-Partition.ps1 -Direction Gauche, puis Operations.ps1 -Action Agrandir au redémarrage.'
     }
     if (-not $win.aligne_1Mo) {
         Add-Constat 'ATTENTION' 'ALN-001' "$($win.lettre) n'est pas alignée sur 1 Mo (performances SSD dégradées)." 'Réalignement possible uniquement hors ligne (WinPE).'
