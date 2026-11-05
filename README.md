@@ -4,6 +4,8 @@ Outil Windows (PowerShell 5.1, aucune installation) pour agrandir, réduire, dé
 système **sans casser le démarrage**. Développé à partir de la documentation publique Microsoft
 (GPT, BCD, WinRE, BitLocker, IOCTL disque), sans code tiers.
 
+![version](https://img.shields.io/badge/version-0.2.0-blue) ![Windows](https://img.shields.io/badge/Windows-10%2F11-0078D6) ![PowerShell](https://img.shields.io/badge/PowerShell-5.1-5391FE)
+
 > ⚠️ **État : code complet, non validé sur matériel réel.** Les opérations qui modifient les disques n'ont été
 > exécutées qu'en simulation. Testez d'abord dans une machine virtuelle (Hyper-V/VirtualBox) avant un vrai PC,
 > et ayez une sauvegarde de vos données.
